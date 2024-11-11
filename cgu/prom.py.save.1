@@ -1,0 +1,164 @@
+from kubernetes import client, config
+from prometheus_client import start_http_server, Gauge
+import time
+from kubernetes.client.rest import ApiException
+
+#kubectl describe nodes to Kubernetes API
+try:
+    config.load_incluster_config()
+except:
+    config.load_kube_config()
+# Create Kubernetes API client
+v1 = client.CoreV1Api()
+
+# 初始化 Prometheus 指标
+cpu_allocatable_metric = Gauge('node_cpu_allocatable', 'Allocatable CPU cores per node', ['node'])
+cpu_capacity_metric = Gauge('node_cpu_capacity', 'Total CPU cores per node', ['node'])
+cpu_allocated_metric = Gauge('node_cpu_allocated', 'Total allocated CPU cores per node', ['node'])
+gpu_allocatable_metric = Gauge('node_gpu_allocatable', 'Allocatable GPUs per node', ['node', 'namespace'])
+gpu_capacity_metric = Gauge('node_gpu_capacity', 'Total GPUs per node', ['node', 'namespace'])
+gpu_allocated_metric = Gauge('node_gpu_allocated', 'Total allocated GPU cores per node', ['node', 'namespace'])
+# 初始化 Prometheus 指标
+node_usage_cpu_metric = Gauge('node_usage_cpu', 'CPU usage per node', ['node'])
+node_usage_gpu_metric = Gauge('node_usage_gpu', 'GPU usage per node', ['node'])
+namespace_usage_cpu_metric = Gauge('namespace_usage_cpu', 'CPU usage per namespace', ['namespace'])
+namespace_usage_gpu_metric = Gauge('namespace_usage_gpu', 'GPU usage per namespace', ['namespace'])
+notebook_usage_cpu = Gauge('notebook_cpu_usage', 'CPU usage of notebooks', ['node', 'namespace', 'notebook'])
+notebook_usage_memory = Gauge('notebook_memory_usage', 'Memory usage of notebooks', ['node', 'namespace', 'notebook'])
+notebook_usage_gpu = Gauge('notebook_gpu_usage', 'GPU usage of notebooks', ['node', 'namespace', 'notebook'])
+
+# 获取 CPU 和 GPU 的信息
+nodes = v1.list_node().items
+cpu_allocatable = {}
+cpu_capacity = {}
+gpu_allocatable = {}
+gpu_capacity = {}
+
+def get_cpu_used(node_name, namespace):
+    pods = v1.list_namespaced_pod(namespace).items
+    cpu_used = 0
+
+    for pod in pods:
+        if pod.spec.node_name == node_name:
+            for container in pod.spec.containers:
+                resources = container.resources
+                if resources and resources.requests and 'cpu' in resources.requests:
+                    cpu_request = resources.requests['cpu']
+                    if cpu_request[-1] == 'm':
+                        cpu_used += int(cpu_request[:-1])/1000.0
+                    else:
+                        cpu_used += int(cpu_request)
+    return cpu_used
+
+def get_gpu_used(node_name, namespace):
+    pods = v1.list_namespaced_pod(namespace).items
+    gpu_used = 0
+
+    for pod in pods:
+        if pod.spec.node_name == node_name:
+            for container in pod.spec.containers:
+            	resources = container.resources
+		if resources and resources.requests:
+                    for resource_name, resource_quantity in resources.requests.items():
+                        if 'gpu' in resource_name.lower():
+                            gpu_used += int(resource_quantity)
+    #        resources and resources.requests and 'gpu' in resources.requests:
+    #                gpu_request = resources.requests['gpu']
+    #                if gpu_request[-1] == 'm':
+    #                    gpu_used += int(gpu_request[:-1])/1000.0
+    #                else:
+    #                	gpu_used += int(gpu_request)
+    return gpu_used
+
+def get_notebook_name(pod):
+    if pod.metadata.name.endswith('-0'):
+        return pod.metadata.name  # '-0'
+    return None
+
+def update_metrics():
+    # Load kubeconfig file
+    nodes = v1.list_node().items
+    namespaces = v1.list_namespace().items
+    pods = v1.list_pod_for_all_namespaces().items  # 列出所有命名空间中的所有Pod
+
+    node_usage_cpu = {}
+    node_usage_gpu = {}
+    namespace_usage_cpu = {}
+    namespace_usage_gpu = {}
+    notebook_usage_cpu_data = {}
+    notebook_usage_gpu_data = {}
+                
+
+    for node in nodes:
+        node_name = node.metadata.name
+        node_usage_cpu[node_name] = 0
+        node_usage_gpu[node_name] = 0
+
+        # cpu_allocatable[node_name] = node.status.allocatable.get('cpu', '0')
+        # cpu_capacity[node_name] = node.status.capacity.get('cpu', '0')
+        # gpu_allocatable[node_name] = node.status.allocatable.get('nvidia.com/gpu', '0')
+        # gpu_capacity[node_name] = node.status.capacity.get('nvidia.com/gpu', '0')
+
+    for namespace in namespaces:
+        namespace_name = namespace.metadata.name
+        namespace_usage_cpu[namespace_name] = 0
+        namespace_usage_gpu[namespace_name] = 0
+        
+    for pod in pods:
+        node_name = pod.spec.node_name
+        namespace_name = pod.metadata.namespace  # 获取 Pod 所在的命名空间
+        # All notebook
+        # notebook_name = pod.metadata.name
+        notebook_name = get_notebook_name(pod)
+
+        #add
+        if notebook_name:
+            if notebook_name is not None:
+                cpu_allocated = get_cpu_used(node_name, namespace_name)
+                gpu_allocated = get_gpu_used(node_name, namespace_name)
+                # 其他操作
+                
+
+            # CPU 信息
+            # cpu_allocatable_metric.labels(node=node_name).set(cpu_allocatable[node_name])
+            # cpu_allocated_metric.labels(node=node_name).set(cpu_allocated)
+            # cpu_capacity_metric.labels(node=node_name).set(cpu_capacity[node_name])
+
+            # GPU 信息
+            # gpu_allocatable_metric.labels(node=node_name, namespace=namespace_name).set(gpu_allocatable[node_name])
+            # gpu_allocated_metric.labels(node=node_name, namespace=namespace_name).set(gpu_allocated)
+            # gpu_capacity_metric.labels(node=node_name, namespace=namespace_name).set(gpu_capacity[node_name])
+
+            
+
+            # 更新命名空间 CPU 和 GPU 使用量
+            namespace_usage_cpu[namespace_name] += cpu_allocated
+            namespace_usage_gpu[namespace_name] += gpu_allocated
+
+        
+            # 设置笔记本 CPU 和 GPU 使用量指标
+            notebook_usage_cpu.labels(node=node_name, namespace=namespace_name, notebook=notebook_name).set(cpu_allocated)
+            notebook_usage_memory.labels(node=node_name, namespace=namespace_name, notebook=notebook_name).set(0)  # 未实现内存使用量
+            notebook_usage_gpu.labels(node=node_name, namespace=namespace_name, notebook=notebook_name).set(gpu_allocated)
+            
+            # 保存笔记本 CPU 和 GPU 使用量数据
+            notebook_usage_cpu_data[(node_name, namespace_name, notebook_name)] = cpu_allocated
+            notebook_usage_gpu_data[(node_name, namespace_name, notebook_name)] = gpu_allocated
+
+    return node_usage_cpu, node_usage_gpu, namespace_usage_cpu, namespace_usage_gpu, notebook_usage_cpu_data, notebook_usage_gpu_data
+
+if __name__ == "__main__":
+    # 启动 Prometheus 客户端服务器
+    start_http_server(8080)  # 确保端口未被占用
+
+    # 定期更新指标
+    while True:
+        node_usage_cpu, node_usage_gpu, namespace_usage_cpu, namespace_usage_gpu, notebook_usage_cpu_data, notebook_usage_gpu_data = update_metrics()
+        print("Node Usage CPU:", node_usage_cpu)
+        print("Node Usage GPU:", node_usage_gpu)
+        print("Namespace Usage CPU:", namespace_usage_cpu)
+        print("Namespace Usage GPU:", namespace_usage_gpu)
+        print("Notebook Usage CPU:", notebook_usage_cpu_data)
+        print("Notebook Usage GPU:", notebook_usage_gpu_data)
+        print("running")
+        time.sleep(60)  # 每 60 秒更新一次
