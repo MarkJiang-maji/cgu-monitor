@@ -1,7 +1,8 @@
 import re
 import time
+import threading
 from kubernetes import client, config
-from prometheus_client import start_http_server, Gauge, Counter
+from prometheus_client import start_http_server, Gauge
 from kubernetes.client.rest import ApiException
 
 try:
@@ -11,7 +12,7 @@ except:
 
 v1 = client.CoreV1Api()
 
-# 定义 Gauge 指标
+# 定义全局 Gauge
 cpu_allocatable_metric = Gauge('node_cpu_allocatable', 'Allocatable CPU cores per node', ['node'])
 gpu_allocatable_metric = Gauge('node_gpu_allocatable', 'Allocatable GPUs per node', ['node'])
 node_usage_cpu_metric = Gauge('node_usage_cpu', 'CPU usage per node', ['node'])
@@ -23,9 +24,9 @@ notebook_usage_memory = Gauge('notebook_memory_usage', 'Memory usage of notebook
 notebook_usage_gpu = Gauge('notebook_gpu_usage', 'GPU usage of notebooks', ['node', 'namespace', 'notebook'])
 memory_allocatable_metric = Gauge('node_memory_allocatable', 'Allocatable memory per node', ['node'])
 
-# 定义 Counter 指标用于记录累积的 CPU/GPU 使用量
-namespace_cpu_cost = Counter('namespace_cpu_cost', 'Accumulated CPU usage cost per namespace', ['namespace'])
-namespace_gpu_cost = Counter('namespace_gpu_cost', 'Accumulated GPU usage cost per namespace', ['namespace'])
+# 新的独立成本指标
+namespace_cpu_cost_metric = Gauge('namespace_cpu_cost', 'Cumulative CPU cost per namespace', ['namespace'])
+namespace_gpu_cost_metric = Gauge('namespace_gpu_cost', 'Cumulative GPU cost per namespace', ['namespace'])
 
 # 上一次的缓存数据
 previous_data = {
@@ -35,7 +36,9 @@ previous_data = {
     'namespace_usage_gpu': {},
     'notebook_usage_cpu_data': {},
     'notebook_usage_gpu_data': {},
-    'notebook_usage_memory_data': {}
+    'notebook_usage_memory_data': {},
+    'namespace_cpu_cost': {},  # CPU 成本缓存
+    'namespace_gpu_cost': {}   # GPU 成本缓存
 }
 
 def parse_memory_string(memory_str):
@@ -103,7 +106,9 @@ def update_metrics():
         'namespace_usage_gpu': {},
         'notebook_usage_cpu_data': {},
         'notebook_usage_gpu_data': {},
-        'notebook_usage_memory_data': {}
+        'notebook_usage_memory_data': {},
+        'namespace_cpu_cost': previous_data.get('namespace_cpu_cost', {}),  # 继承之前的 CPU 成本数据
+        'namespace_gpu_cost': previous_data.get('namespace_gpu_cost', {})   # 继承之前的 GPU 成本数据
     }
 
     try:
@@ -118,7 +123,6 @@ def update_metrics():
             gpu_allocatable_metric.labels(node=node_name).set(node.status.allocatable.get('nvidia.com/gpu', '0'))
             memory_allocatable_metric.labels(node=node_name).set(parse_memory_string(node.status.allocatable.get('memory', '0')))
 
-            # 初始化使用量
             current_data['node_usage_cpu'][node_name] = 0
             current_data['node_usage_gpu'][node_name] = 0
 
@@ -139,36 +143,52 @@ def update_metrics():
                 gpu_allocated = get_gpu_used(pod)
                 memory_allocated = get_memory_used(pod)
 
-                # 更新命名空间和节点的 CPU、GPU 使用量
                 current_data['namespace_usage_cpu'][namespace_name] += cpu_allocated
                 current_data['namespace_usage_gpu'][namespace_name] += gpu_allocated
                 current_data['node_usage_cpu'][node_name] += cpu_allocated
                 current_data['node_usage_gpu'][node_name] += gpu_allocated
 
-                # 更新 Notebook 的 CPU、内存、GPU 使用量
                 current_data['notebook_usage_cpu_data'][(node_name, namespace_name, notebook_name)] = cpu_allocated
                 current_data['notebook_usage_memory_data'][(node_name, namespace_name, notebook_name)] = memory_allocated
                 current_data['notebook_usage_gpu_data'][(node_name, namespace_name, notebook_name)] = gpu_allocated
 
-                # 设置 Gauge 值
                 notebook_usage_cpu.labels(node=node_name, namespace=namespace_name, notebook=notebook_name).set(cpu_allocated)
                 notebook_usage_memory.labels(node=node_name, namespace=namespace_name, notebook=notebook_name).set(memory_allocated)
                 notebook_usage_gpu.labels(node=node_name, namespace=namespace_name, notebook=notebook_name).set(gpu_allocated)
 
-                # 更新 CPU 和 GPU 累积成本
-                namespace_cpu_cost.labels(namespace=namespace_name).inc(cpu_allocated)
-                namespace_gpu_cost.labels(namespace=namespace_name).inc(gpu_allocated)
+        # 更新成本指标（每个命名空间只要有使用量就累加）
+        for namespace_name, cpu_usage in current_data['namespace_usage_cpu'].items():
+            if cpu_usage > 0:
+                # 获取现有的 CPU 成本或初始化为 0
+                current_cpu_cost = current_data['namespace_cpu_cost'].get(namespace_name, 0)
+                # 增加当前使用量
+                current_cpu_cost += cpu_usage
+                # 更新成本数据
+                current_data['namespace_cpu_cost'][namespace_name] = current_cpu_cost
+                # 设置指标值
+                namespace_cpu_cost_metric.labels(namespace=namespace_name).set(current_cpu_cost)
+
+        for namespace_name, gpu_usage in current_data['namespace_usage_gpu'].items():
+            if gpu_usage > 0:
+                # 获取现有的 GPU 成本或初始化为 0
+                current_gpu_cost = current_data['namespace_gpu_cost'].get(namespace_name, 0)
+                # 增加当前使用量
+                current_gpu_cost += gpu_usage
+                # 更新成本数据
+                current_data['namespace_gpu_cost'][namespace_name] = current_gpu_cost
+                # 设置指标值
+                namespace_gpu_cost_metric.labels(namespace=namespace_name).set(current_gpu_cost)
 
     except ApiException as e:
         print(f"API 请求失败：{e}")
         return
 
-    # 清理未更新的过期数据
+    # 清理未更新的过期数据（不包括成本数据）
     def cleanup_previous_data(current, previous, gauge):
         for key in list(previous.keys()):
             if key not in current:
-                gauge.labels(*key).set(0)  # 清理过期的指标
-                del previous[key]          # 从缓存中删除
+                gauge.labels(*key).set(0)
+                del previous[key]
 
     cleanup_previous_data(current_data['node_usage_cpu'], previous_data['node_usage_cpu'], node_usage_cpu_metric)
     cleanup_previous_data(current_data['node_usage_gpu'], previous_data['node_usage_gpu'], node_usage_gpu_metric)
@@ -178,7 +198,6 @@ def update_metrics():
     cleanup_previous_data(current_data['notebook_usage_gpu_data'], previous_data['notebook_usage_gpu_data'], notebook_usage_gpu)
     cleanup_previous_data(current_data['notebook_usage_memory_data'], previous_data['notebook_usage_memory_data'], notebook_usage_memory)
 
-    # 将当前数据保存为前一次的缓存数据
     previous_data = current_data
 
 if __name__ == "__main__":
