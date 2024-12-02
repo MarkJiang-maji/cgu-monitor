@@ -1,9 +1,12 @@
 import re
 import time
 import threading
+import redis
+import os
 from kubernetes import client, config
 from prometheus_client import start_http_server, Gauge
 from kubernetes.client.rest import ApiException
+
 
 try:
     config.load_incluster_config()
@@ -28,10 +31,6 @@ memory_allocatable_metric = Gauge('node_memory_allocatable', 'Allocatable memory
 namespace_cpu_cost_metric = Gauge('namespace_cpu_cost', 'Cumulative CPU cost per namespace', ['namespace'])
 namespace_gpu_cost_metric = Gauge('namespace_gpu_cost', 'Cumulative GPU cost per namespace', ['namespace'])
 
-# 使用时间指标
-namespace_cpu_cost_time_metric = Gauge('namespace_cpu_cost_time', 'Cumulative CPU usage time in minutes per namespace', ['namespace'])
-namespace_gpu_cost_time_metric = Gauge('namespace_gpu_cost_time', 'Cumulative GPU usage time in minutes per namespace', ['namespace'])
-
 # 上一次的缓存数据
 previous_data = {
     'node_usage_cpu': {},
@@ -42,12 +41,11 @@ previous_data = {
     'notebook_usage_gpu_data': {},
     'notebook_usage_memory_data': {},
     'namespace_cpu_cost': {},  # CPU 成本缓存
-    'namespace_gpu_cost': {},  # GPU 成本缓存
-    'namespace_cpu_time': {},      # CPU 使用时间缓存
-    'namespace_gpu_time': {},      # GPU 使用时间缓存
-    'namespace_cpu_start': {},     # CPU 开始使用时间记录
-    'namespace_gpu_start': {}      # GPU 开始使用时间记录
+    'namespace_gpu_cost': {}   # GPU 成本缓存
 }
+
+CPU_COST_PER_MINUTE = 2  # CPU的使用成本每分鐘2元
+GPU_COST_PER_MINUTE = 10 # GPU的使用成本每分鐘10元
 
 def parse_memory_string(memory_str):
     if memory_str.endswith('Ki'):
@@ -116,11 +114,7 @@ def update_metrics():
         'notebook_usage_gpu_data': {},
         'notebook_usage_memory_data': {},
         'namespace_cpu_cost': previous_data.get('namespace_cpu_cost', {}),  # 继承之前的 CPU 成本数据
-        'namespace_gpu_cost': previous_data.get('namespace_gpu_cost', {}),  # 继承之前的 GPU 成本数据
-        'namespace_cpu_time': previous_data.get('namespace_cpu_time', {}),
-        'namespace_gpu_time': previous_data.get('namespace_gpu_time', {}),
-        'namespace_cpu_start': previous_data.get('namespace_cpu_start', {}),
-        'namespace_gpu_start': previous_data.get('namespace_gpu_start', {})
+        'namespace_gpu_cost': previous_data.get('namespace_gpu_cost', {})   # 继承之前的 GPU 成本数据
     }
 
     try:
@@ -168,50 +162,25 @@ def update_metrics():
                 notebook_usage_memory.labels(node=node_name, namespace=namespace_name, notebook=notebook_name).set(memory_allocated)
                 notebook_usage_gpu.labels(node=node_name, namespace=namespace_name, notebook=notebook_name).set(gpu_allocated)
 
-        # 更新成本和时间指标
-        current_time = time.time()
-
         # 更新成本指标（每个命名空间只要有使用量就累加）
         for namespace_name, cpu_usage in current_data['namespace_usage_cpu'].items():
             if cpu_usage > 0:
-                # 获取现有的 CPU 成本或初始化为 0
+                # 取得已經有的 CPU 成本或初始化为 0
                 current_cpu_cost = current_data['namespace_cpu_cost'].get(namespace_name, 0)
-                current_cpu_cost += cpu_usage
+                # 增加当前使用成本（每分鐘指定成本）
+                current_cpu_cost += cpu_usage * CPU_COST_PER_MINUTE
+                # 更新成本数据
                 current_data['namespace_cpu_cost'][namespace_name] = current_cpu_cost
+                # 设置指标值
                 namespace_cpu_cost_metric.labels(namespace=namespace_name).set(current_cpu_cost)
 
-                # CPU 使用时间更新
-                if namespace_name not in current_data['namespace_cpu_start']:
-                    current_data['namespace_cpu_start'][namespace_name] = current_time
-                    current_data['namespace_cpu_time'][namespace_name] = 0
-                else:
-                    # 计算使用时间（分钟）
-                    current_data['namespace_cpu_time'][namespace_name] = round(
-                        (current_time - current_data['namespace_cpu_start'][namespace_name]) / 60
-                    )
-                namespace_cpu_cost_time_metric.labels(namespace=namespace_name).set(
-                    current_data['namespace_cpu_time'][namespace_name]
-                )
         for namespace_name, gpu_usage in current_data['namespace_usage_gpu'].items():
             if gpu_usage > 0:
-                # 获取现有的 GPU 成本或初始化为 0
                 current_gpu_cost = current_data['namespace_gpu_cost'].get(namespace_name, 0)
-                current_gpu_cost += gpu_usage
+                current_gpu_cost += gpu_usage * GPU_COST_PER_MINUTE
                 current_data['namespace_gpu_cost'][namespace_name] = current_gpu_cost
                 namespace_gpu_cost_metric.labels(namespace=namespace_name).set(current_gpu_cost)
-            
-                # GPU 使用时间更新
-                if namespace_name not in current_data['namespace_gpu_start']:
-                    current_data['namespace_gpu_start'][namespace_name] = current_time
-                    current_data['namespace_gpu_time'][namespace_name] = 0
-                else:
-                    # 计算使用时间（分钟）
-                    current_data['namespace_gpu_time'][namespace_name] = round(
-                        (current_time - current_data['namespace_gpu_start'][namespace_name]) / 60
-                    )
-                namespace_gpu_cost_time_metric.labels(namespace=namespace_name).set(
-                    current_data['namespace_gpu_time'][namespace_name]
-                )
+
     except ApiException as e:
         print(f"API 请求失败：{e}")
         return
