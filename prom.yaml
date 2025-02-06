@@ -41,7 +41,7 @@ metadata:
 spec:
   selector:
     matchLabels:
-      app: prom-app
+      app: node-resource-monitor
   namespaceSelector:
     matchNames:
       - cgu  # 指定要监控的命名空间
@@ -53,10 +53,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: prom-app
+  name: node-resource-monitor
   namespace: cgu
   labels:
-    app: prom-app
+    app: node-resource-monitor
 spec:
   type: NodePort
   selector:
@@ -74,7 +74,7 @@ metadata:
   name: prom-service-account
   namespace: cgu
   labels:
-    app: prom-app
+    app: node-resource-monitor
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -83,7 +83,7 @@ metadata:
  name: node-access
 rules:
 - apiGroups: [""]
-  resources: ["nodes","pods"]
+  resources: ["nodes","pods","namespaces"]
   verbs: ["get", "list", "watch"]
 
 ---
