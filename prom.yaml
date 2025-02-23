@@ -25,7 +25,7 @@ spec:
             requests:
               cpu: 200m
               memory: 256Mi
-          image: markjiang10/cgu-monitor:v245-3 #your-docker-username/your-repository:your-tag  #  替换为您打包的 Python 应用的 Docker 镜像名称。
+          image: markjiang10/cgu-monitor:v60 #your-docker-username/your-repository:your-tag  #  替换为您打包的 Python 应用的 Docker 镜像名称。
           ports:
           - containerPort: 8080  # Prometheus 客户端暴露的端口
     

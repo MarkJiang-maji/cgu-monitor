@@ -6,6 +6,7 @@ import os
 from kubernetes import client, config
 from prometheus_client import start_http_server, Gauge
 from kubernetes.client.rest import ApiException
+from kubernetes.client import CustomObjectsApi  # 新增導入
 
 
 try:
@@ -14,6 +15,8 @@ except:
     config.load_kube_config()
 
 v1 = client.CoreV1Api()
+custom_api = client.CustomObjectsApi()
+
 
 # 定义全局 Gauge
 cpu_allocatable_metric = Gauge('node_cpu_allocatable', 'Allocatable CPU cores per node', ['node'])
@@ -43,9 +46,6 @@ previous_data = {
     'namespace_cpu_cost': {},  # CPU 成本缓存
     'namespace_gpu_cost': {}   # GPU 成本缓存
 }
-
-CPU_COST_PER_MINUTE = 2  # CPU的使用成本每分鐘2元
-GPU_COST_PER_MINUTE = 10 # GPU的使用成本每分鐘10元
 
 def parse_memory_string(memory_str):
     if memory_str.endswith('Ki'):
@@ -103,6 +103,52 @@ def get_notebook_name(pod):
         return pod.metadata.name
     return None
 
+
+# ================= 配置常量 =================
+PROFILE_GROUP = "kubeflow.org"
+PROFILE_VERSION = "v1"
+PROFILE_PLURAL = "profiles"
+CPU_COST_PER_MINUTE = 2  # 元/分钟/cpu
+GPU_COST_PER_MINUTE = 10 # 元/分钟/gpu
+# ============================================
+
+def update_profile_labels():
+    global previous_data
+    try:
+        # 正確的 cluster-scoped 請求
+        profiles = custom_api.list_cluster_custom_object(
+            group=PROFILE_GROUP,
+            version=PROFILE_VERSION,
+            plural=PROFILE_PLURAL
+        )
+        
+        for profile in profiles.get('items', []):
+            namespace = profile['metadata']['name']  # Profile 名即 namespace 名
+            cpu_cost = previous_data['namespace_cpu_cost'].get(namespace, 0)
+            gpu_cost = previous_data['namespace_gpu_cost'].get(namespace, 0)
+            
+            # 使用 strategic merge patch 只更新 labels
+            patch = {
+                "metadata": {
+                    "labels": {
+                        "cpucost": f"{cpu_cost:.2f}",
+                        "gpucost": f"{gpu_cost:.2f}"
+                    }
+                }
+            }
+            
+            custom_api.patch_cluster_custom_object(
+                group=PROFILE_GROUP,
+                version=PROFILE_VERSION,
+                plural=PROFILE_PLURAL,
+                name=namespace,
+                body=patch
+            )
+            print(f"Updated profile {namespace}: CPU={cpu_cost:.2f}, GPU={gpu_cost:.2f}")
+
+    except ApiException as e:
+        print(f"Profile update failed: {e.status} - {e.reason}")
+
 def update_metrics():
     global previous_data
     current_data = {
@@ -113,8 +159,8 @@ def update_metrics():
         'notebook_usage_cpu_data': {},
         'notebook_usage_gpu_data': {},
         'notebook_usage_memory_data': {},
-        'namespace_cpu_cost': previous_data.get('namespace_cpu_cost', {}),  # 继承之前的 CPU 成本数据
-        'namespace_gpu_cost': previous_data.get('namespace_gpu_cost', {})   # 继承之前的 GPU 成本数据
+        'namespace_cpu_cost': previous_data['namespace_cpu_cost'].copy(),
+        'namespace_gpu_cost': previous_data['namespace_gpu_cost'].copy()
     }
 
     try:
@@ -138,7 +184,7 @@ def update_metrics():
             current_data['namespace_usage_cpu'][namespace_name] = 0
             current_data['namespace_usage_gpu'][namespace_name] = 0
 
-        # Pod 级别的 CPU、GPU 和内存使用量
+        # Pod 的 CPU、GPU 和内存使用量
         for pod in pods:
             node_name = pod.spec.node_name
             namespace_name = pod.metadata.namespace
@@ -180,9 +226,15 @@ def update_metrics():
                 current_gpu_cost += gpu_usage * GPU_COST_PER_MINUTE
                 current_data['namespace_gpu_cost'][namespace_name] = current_gpu_cost
                 namespace_gpu_cost_metric.labels(namespace=namespace_name).set(current_gpu_cost)
+       
+        # 更新 Profile 标签
+        update_profile_labels()
 
     except ApiException as e:
-        print(f"API 请求失败：{e}")
+        print(f"Kubernetes API Error: {e.status} - {e.reason}")
+        return
+    except Exception as e:
+        print(f"Unexpected error: {str(e)}")
         return
 
     # 清理未更新的过期数据（不包括成本数据）
